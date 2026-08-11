@@ -38,6 +38,9 @@ interface ServiceDef {
   name: string;
   host: string;
   configured: boolean;
+  // Set when the user has an access request in flight (e.g. Reddit's API
+  // approval gate) but doesn't have working credentials yet.
+  requested?: boolean;
 }
 
 function envPresent(...names: string[]): boolean {
@@ -68,6 +71,7 @@ const SERVICES: ServiceDef[] = [
     name: "Reddit",
     host: "www.reddit.com",
     configured: envPresent("REDDIT_CLIENT_ID", "REDDIT_CLIENT_SECRET"),
+    requested: envPresent("REDDIT_API_REQUESTED"),
   },
   {
     id: "bluesky",
@@ -86,6 +90,14 @@ export async function GET() {
   const services = await Promise.all(
     SERVICES.map(async (s) => {
       if (!s.configured) {
+        if (s.requested) {
+          return {
+            id: s.id,
+            name: s.name,
+            status: "pending",
+            detail: "API access request submitted — awaiting approval",
+          };
+        }
         return { id: s.id, name: s.name, status: "unconfigured", detail: "no API key configured" };
       }
       const r = await probe(s.host);

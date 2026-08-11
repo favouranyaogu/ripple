@@ -7,6 +7,7 @@ import DuplicatesSection from "@/components/monitor/DuplicatesSection";
 import ServiceHealth from "@/components/ServiceHealth";
 
 interface ScanResponse {
+  sessionId?: string;
   newIssues?: Issue[];
   possibleDuplicates?: Duplicate[];
   skippedPlatforms?: (string | { platform: string; reason: string })[];
@@ -62,6 +63,8 @@ type BatchEvent =
       skippedPlatforms: (string | { platform: string; reason: string })[];
       newIssues: Issue[];
       possibleDuplicates: Duplicate[];
+      aiUnavailable?: boolean;
+      rawResults?: { title: string; url: string; content: string }[];
     }
   | { type: "skipped"; index: number; total: number; subTarget: string; reason: string }
   | { type: "error"; index: number; total: number; subTarget: string; error: string }
@@ -169,6 +172,7 @@ export default function MonitorPage() {
   const [topic, setTopic] = useState("");
   const [type, setType] = useState("Auto Detect");
   const [focus, setFocus] = useState("");
+  const [batchFocus, setBatchFocus] = useState("");
   const [batchMode, setBatchMode] = useState(false);
   const [subTargetsText, setSubTargetsText] = useState("");
   const [delaySeconds, setDelaySeconds] = useState("30");
@@ -190,9 +194,15 @@ export default function MonitorPage() {
   const [batchSummary, setBatchSummary] = useState<{ completed: number; skipped: number; failed: number } | null>(null);
   const [subTargetsError, setSubTargetsError] = useState(false);
   const batchAbortRef = useRef<AbortController | null>(null);
+  // Tracks the active monitoring session per topic. Reusing the session across
+  // scans of the same topic lets the server flag new issues that duplicate ones
+  // already tracked (the "Possible Duplicates" section) instead of starting
+  // fresh every time.
+  const sessionRef = useRef<{ topic: string; id: string | null }>({ topic: "", id: null });
 
   const [platformStatus, setPlatformStatus] = useState<{
     reddit: boolean;
+    redditPending: boolean;
     twitter: boolean;
     bluesky: boolean;
   } | null>(null);
@@ -242,16 +252,24 @@ export default function MonitorPage() {
   useEffect(() => {
     fetch("/api/platform-status")
       .then((res) => (res.ok ? res.json() : null))
-      .then((data: { reddit?: boolean; twitter?: boolean; bluesky?: boolean } | null) => {
-        if (
-          data &&
-          typeof data.reddit === "boolean" &&
-          typeof data.twitter === "boolean" &&
-          typeof data.bluesky === "boolean"
-        ) {
-          setPlatformStatus({ reddit: data.reddit, twitter: data.twitter, bluesky: data.bluesky });
+      .then(
+        (data: { reddit?: boolean; redditPending?: boolean; twitter?: boolean; bluesky?: boolean } | null) => {
+          if (
+            data &&
+            typeof data.reddit === "boolean" &&
+            typeof data.redditPending === "boolean" &&
+            typeof data.twitter === "boolean" &&
+            typeof data.bluesky === "boolean"
+          ) {
+            setPlatformStatus({
+              reddit: data.reddit,
+              redditPending: data.redditPending,
+              twitter: data.twitter,
+              bluesky: data.bluesky,
+            });
+          }
         }
-      })
+      )
       .catch(() => {
         // Endpoint unavailable — notes stay hidden until a scan reports skips.
       });
@@ -262,6 +280,9 @@ export default function MonitorPage() {
   // A platform is "unconfigured" when its API keys are missing server-side.
   const redditUnconfigured =
     platformStatus !== null ? !platformStatus.reddit : skippedPlatforms.includes("reddit");
+  // Reddit's API requires pre-approval for new apps; REDDIT_API_REQUESTED marks
+  // a submitted-but-unapproved request so the UI shows "pending" not "missing".
+  const redditPending = platformStatus !== null ? platformStatus.redditPending : false;
   const twitterUnconfigured =
     platformStatus !== null ? !platformStatus.twitter : skippedPlatforms.includes("twitter");
   const blueskyUnconfigured =
@@ -331,17 +352,29 @@ export default function MonitorPage() {
     setAiUnavailable(false);
     setRawResults([]);
     closePastScan();
+    // Reuse the session when scanning the same topic so new issues are
+    // deduped against already-tracked ones; start a fresh session on a new topic.
+    if (sessionRef.current.topic !== topic) {
+      sessionRef.current = { topic, id: null };
+    }
     try {
       const res = await fetch("/api/scan", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ topic, type, focus, platforms }),
+        body: JSON.stringify({
+          topic,
+          type,
+          focus,
+          platforms,
+          ...(sessionRef.current.id ? { sessionId: sessionRef.current.id } : {}),
+        }),
       });
       if (!res.ok) {
         const errData = (await res.json().catch(() => ({}))) as { error?: string };
         throw new Error(errData.error || "Scan request failed");
       }
       const data: ScanResponse = await res.json();
+      if (!sessionRef.current.id && data.sessionId) sessionRef.current.id = data.sessionId;
       setIssues(data.newIssues ?? []);
       setDuplicates(data.possibleDuplicates ?? []);
       setSkippedPlatforms(data.skippedPlatforms ?? []);
@@ -413,6 +446,7 @@ export default function MonitorPage() {
     setBatchSummary(null);
     setHasScanned(false);
     setError(null);
+    sessionRef.current = { topic: "", id: null };
   };
 
   // --- Batch mode -----------------------------------------------------------
@@ -421,6 +455,22 @@ export default function MonitorPage() {
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean);
+
+  // Comma-separated focus list helpers (multi-focus: chips toggle individual terms).
+  const parseFocusTerms = (value: string) =>
+    value
+      .split(",")
+      .map((t) => t.trim())
+      .filter(Boolean);
+  const toggleFocusTerm = (value: string, setter: (v: string) => void, term: string) => {
+    const terms = parseFocusTerms(value);
+    const idx = terms.findIndex((t) => t.toLowerCase() === term.toLowerCase());
+    if (idx >= 0) terms.splice(idx, 1);
+    else terms.push(term);
+    setter(terms.join(", "));
+  };
+  const focusTerms = parseFocusTerms(focus).map((t) => t.toLowerCase());
+  const batchFocusTerms = parseFocusTerms(batchFocus).map((t) => t.toLowerCase());
 
   const applyBatchEvent = (evt: BatchEvent) => {
     switch (evt.type) {
@@ -446,6 +496,11 @@ export default function MonitorPage() {
         );
         if (evt.newIssues.length > 0) setIssues((prev) => [...prev, ...evt.newIssues]);
         if (evt.possibleDuplicates.length > 0) setDuplicates((prev) => [...prev, ...evt.possibleDuplicates]);
+        if (evt.aiUnavailable) {
+          setAiUnavailable(true);
+          const raw = evt.rawResults ?? [];
+          if (raw.length > 0) setRawResults((prev) => [...prev, ...raw]);
+        }
         break;
       case "skipped":
         setBatchItems((prev) =>
@@ -498,7 +553,7 @@ export default function MonitorPage() {
       const res = await fetch("/api/batch-scan", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ topic, type, subTargets: parsedTargets, platforms, delaySeconds: delay }),
+        body: JSON.stringify({ topic, type, focus: batchFocus, subTargets: parsedTargets, platforms, delaySeconds: delay }),
         signal: abort.signal,
       });
       if (!res.ok || !res.body) {
@@ -745,45 +800,88 @@ export default function MonitorPage() {
 
               {/* Focus or sub-targets */}
               {batchMode ? (
-                <div>
-                  <label htmlFor="subTargets" className={labelClass}>
-                    Sub-targets{" "}
-                    <span className="text-muted font-normal text-xs">(comma-separated)</span>
-                  </label>
-                  <textarea
-                    id="subTargets"
-                    rows={2}
-                    value={subTargetsText}
-                    onChange={(e) => {
-                      setSubTargetsText(e.target.value);
-                      setSubTargetsError(false);
-                    }}
-                    placeholder={SUBTARGET_EXAMPLE}
-                    className={`${subTargetsError ? inputErrorClass : inputClass} resize-none`}
-                    style={AUTOFILL_FIX}
-                    disabled={batchRunning}
-                    aria-invalid={subTargetsError}
-                  />
-                  <p
-                    className={`mt-1.5 text-[11px] font-mono ${
-                      subTargetsError ? "text-negative" : "text-subtle"
-                    }`}
-                  >
-                    {subTargetsError
-                      ? "Enter at least one sub-target"
-                      : parsedTargets.length > 0
-                      ? `${parsedTargets.length} sub-target${parsedTargets.length > 1 ? "s" : ""} ready`
-                      : "Separate with commas — one scan runs per line item"}
-                  </p>
-                  {subTargetsText === "" && !batchRunning && (
-                    <button
-                      type="button"
-                      onClick={() => setSubTargetsText(SUBTARGET_EXAMPLE)}
-                      className={`${pickChip} mt-1`}
+                <div className="space-y-5">
+                  <div>
+                    <label htmlFor="subTargets" className={labelClass}>
+                      Sub-targets{" "}
+                      <span className="text-muted font-normal text-xs">(comma-separated)</span>
+                    </label>
+                    <textarea
+                      id="subTargets"
+                      rows={2}
+                      value={subTargetsText}
+                      onChange={(e) => {
+                        setSubTargetsText(e.target.value);
+                        setSubTargetsError(false);
+                      }}
+                      placeholder={SUBTARGET_EXAMPLE}
+                      className={`${subTargetsError ? inputErrorClass : inputClass} resize-none`}
+                      style={AUTOFILL_FIX}
+                      disabled={batchRunning}
+                      aria-invalid={subTargetsError}
+                    />
+                    <p
+                      className={`mt-1.5 text-[11px] font-mono ${
+                        subTargetsError ? "text-negative" : "text-subtle"
+                      }`}
                     >
-                      Use example: {SUBTARGET_EXAMPLE}
-                    </button>
-                  )}
+                      {subTargetsError
+                        ? "Enter at least one sub-target"
+                        : parsedTargets.length > 0
+                        ? `${parsedTargets.length} sub-target${parsedTargets.length > 1 ? "s" : ""} ready`
+                        : "Separate with commas — one scan runs per line item"}
+                    </p>
+                    {subTargetsText === "" && !batchRunning && (
+                      <button
+                        type="button"
+                        onClick={() => setSubTargetsText(SUBTARGET_EXAMPLE)}
+                        className={`${pickChip} mt-1`}
+                      >
+                        Use example: {SUBTARGET_EXAMPLE}
+                      </button>
+                    )}
+                  </div>
+
+                  {/* Focus types applied to every sub-target */}
+                  <div>
+                    <label htmlFor="batchFocus" className={labelClass}>
+                      Focus on{" "}
+                      <span className="text-muted font-normal text-xs">
+                        (applies to all sub-targets)
+                      </span>
+                    </label>
+                    <input
+                      id="batchFocus"
+                      type="text"
+                      value={batchFocus}
+                      onChange={(e) => setBatchFocus(e.target.value)}
+                      placeholder="e.g. bugs, complaints, security, pricing"
+                      className={inputClass}
+                      style={AUTOFILL_FIX}
+                      disabled={batchRunning}
+                    />
+                    {!batchRunning && (
+                      <div className="mt-2.5 flex flex-wrap items-center gap-1.5">
+                        {FOCUS_SUGGESTIONS.map((s) => {
+                          const active = batchFocusTerms.includes(s);
+                          return (
+                            <button
+                              key={s}
+                              type="button"
+                              onClick={() => toggleFocusTerm(batchFocus, setBatchFocus, s)}
+                              className={`${pickChip} ${
+                                active
+                                  ? "border-accent/50 bg-indigo-50 text-accent hover:text-accent"
+                                  : ""
+                              }`}
+                            >
+                              {active ? "✓" : "+"} {s}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
                 </div>
               ) : (
                 <div>
@@ -803,20 +901,23 @@ export default function MonitorPage() {
                   />
                   {!batchRunning && (
                     <div className="mt-2.5 flex flex-wrap items-center gap-1.5">
-                      {FOCUS_SUGGESTIONS.map((s) => (
-                        <button
-                          key={s}
-                          type="button"
-                          onClick={() => setFocus(focus === s ? "" : s)}
-                          className={`${pickChip} ${
-                            focus === s
-                              ? "border-accent/50 bg-indigo-50 text-accent hover:text-accent"
-                              : ""
-                          }`}
-                        >
-                          {focus === s ? "✓" : "+"} {s}
-                        </button>
-                      ))}
+                      {FOCUS_SUGGESTIONS.map((s) => {
+                        const active = focusTerms.includes(s);
+                        return (
+                          <button
+                            key={s}
+                            type="button"
+                            onClick={() => toggleFocusTerm(focus, setFocus, s)}
+                            className={`${pickChip} ${
+                              active
+                                ? "border-accent/50 bg-indigo-50 text-accent hover:text-accent"
+                                : ""
+                            }`}
+                          >
+                            {active ? "✓" : "+"} {s}
+                          </button>
+                        );
+                      })}
                     </div>
                   )}
                 </div>
@@ -844,10 +945,11 @@ export default function MonitorPage() {
                   />
                 </div>
                 <p className="text-xs text-muted leading-relaxed pb-1.5">
-                  Each sub-target runs as its own scan with{" "}
-                  <code className="font-mono text-accent">focus = sub-target</code>. The X daily
-                  budget is enforced across the whole batch — once it&apos;s reached, the remaining
-                  sub-targets are skipped.
+                  Each sub-target runs as its own scan, biased toward the focus types above{" "}
+                  (e.g. <code className="font-mono text-accent">bugs</code>,{" "}
+                  <code className="font-mono text-accent">complaints</code>) plus the sub-target
+                  itself. The X daily budget is enforced across the whole batch — once it&apos;s
+                  reached, the remaining sub-targets are skipped.
                 </p>
               </div>
             )}
@@ -871,7 +973,11 @@ export default function MonitorPage() {
                       note = <span className="text-uncertain">no API key configured</span>;
                     }
                   } else if (id === "reddit" && redditUnconfigured) {
-                    note = <span className="text-uncertain">no API key configured</span>;
+                    note = redditPending ? (
+                      <span className="text-uncertain">API request submitted — awaiting approval</span>
+                    ) : (
+                      <span className="text-uncertain">no API key configured</span>
+                    );
                   } else if (id === "bluesky" && blueskyUnconfigured) {
                     note = <span className="text-uncertain">no API key configured</span>;
                   }
@@ -1406,6 +1512,11 @@ export default function MonitorPage() {
                         className="text-sm text-foreground font-medium truncate text-left hover:text-accent transition-colors"
                       >
                         {s.topic}
+                        {s.focus && (
+                          <span className="text-muted font-normal">
+                            {" "}→ {s.focus}
+                          </span>
+                        )}
                       </button>
                       <button
                         type="button"

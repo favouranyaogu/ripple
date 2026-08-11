@@ -132,23 +132,29 @@ const TYPE_BIAS_TERMS: Record<string, TypeBias> = {
 function buildExpandedQuery(topic: string, type?: string, focus?: string): string {
   const parts: string[] = [topic.trim()];
   const normalizedType = type?.trim();
-  const focusLower = (focus ?? '').toLowerCase().trim();
+  // Focus may be a comma-separated list (e.g. "bugs, complaints") — each term
+  // contributes its own bias terms and is added to the query literally.
+  const focusTerms = (focus ?? '')
+    .split(',')
+    .map((t) => t.trim())
+    .filter(Boolean);
+  const focusLower = focusTerms.join(' ').toLowerCase();
 
   if (normalizedType && normalizedType !== 'Auto Detect') {
     const bias = TYPE_BIAS_TERMS[normalizedType];
     if (bias) {
-      const matchedKeys = Object.keys(bias.byFocus).filter((key) =>
-        focusLower ? focusLower.includes(key) : false
-      );
+      const matchedKeys = focusLower
+        ? Object.keys(bias.byFocus).filter((key) => focusLower.includes(key))
+        : [];
       const terms =
-        matchedKeys.length > 0 ? matchedKeys.flatMap((key) => bias.byFocus[key]) : bias.default;
+        matchedKeys.length > 0
+          ? Array.from(new Set(matchedKeys.flatMap((key) => bias.byFocus[key])))
+          : bias.default;
       parts.push(...terms);
     }
   }
 
-  if (focus?.trim()) {
-    parts.push(focus.trim());
-  }
+  parts.push(...focusTerms);
 
   return parts.join(' ');
 }
@@ -215,12 +221,14 @@ interface SingleScanResult {
     postUrls: { url: string; excerpt: string }[];
   }[];
   possibleDuplicates: {
-    name: string;
-    sentiment: { positive: number; negative: number; uncertain: number };
-    postUrls: { url: string; excerpt: string }[];
-    duplicateOf: { id: string; name: string; reason: string };
+    newIssueName: string;
+    existingIssueId: string;
+    existingIssueName: string;
+    reason: string;
   }[];
   skippedPlatforms: (string | { platform: string; reason: string })[];
+  aiUnavailable?: boolean;
+  rawResults?: { title: string; url: string; content: string }[];
 }
 
 /**
@@ -270,65 +278,71 @@ async function runSingleScan(opts: {
   const newIssues: SingleScanResult['newIssues'] = [];
   const possibleDuplicates: SingleScanResult['possibleDuplicates'] = [];
 
+  // AI clustering with graceful degradation, mirroring /api/scan: if Gemini is
+  // unreachable, the sub-target still returns its raw search results instead of
+  // failing — and crucially the scan is still recorded in history below.
+  let aiUnavailable = false;
   if (searchResults.length > 0) {
-    const clusterResult = await clusterPosts(searchPosts, { topic, community: '', project: '' });
+    try {
+      const clusterResult = await clusterPosts(searchPosts, { topic, community: '', project: '' });
 
-    const existingIssues = (await sql`
-      SELECT id::text as id, name FROM issues
-      WHERE session_id = ${sessionId} AND expires_at > NOW()
-    `) as { id: string; name: string }[];
+      const existingIssues = (await sql`
+        SELECT id::text as id, name FROM issues
+        WHERE session_id = ${sessionId} AND expires_at > NOW()
+      `) as { id: string; name: string }[];
 
-    const newIssueNames = clusterResult.issues.map((i) => ({ name: i.name }));
-    const duplicates =
-      newIssueNames.length > 0
-        ? (await flagDuplicateIssues(existingIssues, newIssueNames)).duplicates || []
-        : [];
+      const newIssueNames = clusterResult.issues.map((i) => ({ name: i.name }));
+      const duplicates =
+        newIssueNames.length > 0
+          ? (await flagDuplicateIssues(existingIssues, newIssueNames)).duplicates || []
+          : [];
 
-    for (const issue of clusterResult.issues) {
-      const duplicateMatch = duplicates.find(
-        (d) => d.newIssueName.toLowerCase() === issue.name.toLowerCase()
-      );
+      for (const issue of clusterResult.issues) {
+        const duplicateMatch = duplicates.find(
+          (d) => d.newIssueName.toLowerCase() === issue.name.toLowerCase()
+        );
 
-      if (duplicateMatch) {
-        possibleDuplicates.push({
-          name: issue.name,
-          sentiment: issue.sentiment,
-          postUrls: issue.postUrls,
-          duplicateOf: {
-            id: duplicateMatch.existingIssueId,
-            name: duplicateMatch.existingIssueName,
+        if (duplicateMatch) {
+          possibleDuplicates.push({
+            newIssueName: issue.name,
+            existingIssueId: duplicateMatch.existingIssueId,
+            existingIssueName: duplicateMatch.existingIssueName,
             reason: duplicateMatch.reason,
-          },
-        });
-      } else {
-        const issueResult = await sql`
-          INSERT INTO issues (session_id, name, sentiment_positive, sentiment_negative, sentiment_uncertain, first_seen, expires_at)
-          VALUES (${sessionId}, ${issue.name}, ${issue.sentiment.positive}, ${issue.sentiment.negative}, ${issue.sentiment.uncertain}, NOW(), NOW() + INTERVAL '48 hours')
-          RETURNING id
-        `;
-        const issueId = issueResult[0].id;
+          });
+        } else {
+          const issueResult = await sql`
+            INSERT INTO issues (session_id, name, sentiment_positive, sentiment_negative, sentiment_uncertain, first_seen, expires_at)
+            VALUES (${sessionId}, ${issue.name}, ${issue.sentiment.positive}, ${issue.sentiment.negative}, ${issue.sentiment.uncertain}, NOW(), NOW() + INTERVAL '48 hours')
+            RETURNING id
+          `;
+          const issueId = issueResult[0].id;
 
-        for (const postSource of issue.postUrls) {
-          const matchedPost = searchPosts.find((p) => p.url === postSource.url);
-          if (matchedPost) {
-            await sql`
-              INSERT INTO posts (issue_id, content, platform, url, posted_at)
-              VALUES (${issueId}, ${matchedPost.content}, ${matchedPost.platform}, ${matchedPost.url}, NOW())
-            `;
+          for (const postSource of issue.postUrls) {
+            const matchedPost = searchPosts.find((p) => p.url === postSource.url);
+            if (matchedPost) {
+              await sql`
+                INSERT INTO posts (issue_id, content, platform, url, posted_at)
+                VALUES (${issueId}, ${matchedPost.content}, ${matchedPost.platform}, ${matchedPost.url}, NOW())
+              `;
+            }
           }
-        }
 
-        newIssues.push({
-          id: issueId,
-          name: issue.name,
-          sentiment: issue.sentiment,
-          postUrls: issue.postUrls,
-        });
+          newIssues.push({
+            id: issueId,
+            name: issue.name,
+            sentiment: issue.sentiment,
+            postUrls: issue.postUrls,
+          });
+        }
       }
+    } catch (err) {
+      console.error(`[batch-scan] AI clustering unavailable for sub-target "${focus}":`, err);
+      aiUnavailable = true;
     }
   }
 
-  // Record the scan in history (failure to record must not fail the scan).
+  // Record the scan in history — always, including AI failures, so batch scans
+  // show up in the Recent scans timeline. Failure to record must not fail.
   try {
     await sql`
       INSERT INTO scans (session_id, topic, type, focus, platforms, available_platforms, skipped_platforms, result_count, new_issue_count)
@@ -343,6 +357,7 @@ async function runSingleScan(opts: {
     newIssues,
     possibleDuplicates,
     skippedPlatforms,
+    ...(aiUnavailable ? { aiUnavailable: true as const, rawResults: searchResults } : {}),
   };
 }
 
@@ -350,7 +365,11 @@ const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve,
 
 /**
  * POST /api/batch-scan
- * Body: { topic, type?, subTargets: string[], platforms: string[], delaySeconds? }
+ * Body: { topic, type?, focus?, subTargets: string[], platforms: string[], delaySeconds? }
+ *
+ * `focus` (optional) is a comma-separated list of focus types (e.g.
+ * "bugs, complaints") applied to every sub-target on top of the sub-target
+ * itself.
  *
  * Streams NDJSON events, one per line:
  *   {"type":"start", ...}
@@ -368,6 +387,7 @@ export async function POST(request: NextRequest) {
   let body: {
     topic?: unknown;
     type?: unknown;
+    focus?: unknown;
     subTargets?: unknown;
     platforms?: unknown;
     delaySeconds?: unknown;
@@ -383,6 +403,10 @@ export async function POST(request: NextRequest) {
 
   const topic = typeof body.topic === 'string' ? body.topic.trim() : '';
   const type = typeof body.type === 'string' ? body.type.trim() : undefined;
+  // Optional focus types (e.g. "bugs, complaints") applied to EVERY sub-target:
+  // each sub-target's scan biases toward these terms on top of targeting the
+  // sub-target itself.
+  const focus = typeof body.focus === 'string' ? body.focus.trim() : '';
   const rawTargets = Array.isArray(body.subTargets)
     ? body.subTargets.filter((t): t is string => typeof t === 'string').map((t) => t.trim())
     : [];
@@ -423,7 +447,7 @@ export async function POST(request: NextRequest) {
         const total = subTargets.length;
         const { available, skipped: baseSkipped } = resolvePlatforms(platforms);
 
-        send({ type: 'start', total, topic, subTargets, platforms, delaySeconds: delay });
+        send({ type: 'start', total, topic, focus, subTargets, platforms, delaySeconds: delay });
 
         // One session for the whole batch so issues accumulate and dedupe.
         const sessionResult = await sql`
@@ -468,7 +492,7 @@ export async function POST(request: NextRequest) {
               sessionId,
               topic,
               type,
-              focus: subTarget,
+              focus: [subTarget, focus].filter(Boolean).join(', '),
               platforms,
               availablePlatforms: available,
               baseSkipped,
@@ -485,6 +509,9 @@ export async function POST(request: NextRequest) {
               skippedPlatforms: result.skippedPlatforms,
               newIssues: result.newIssues,
               possibleDuplicates: result.possibleDuplicates,
+              ...(result.aiUnavailable
+                ? { aiUnavailable: true as const, rawResults: result.rawResults ?? [] }
+                : {}),
             });
           } catch (err) {
             failed++;

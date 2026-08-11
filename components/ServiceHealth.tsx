@@ -5,7 +5,7 @@ import { useEffect, useState } from "react";
 interface Service {
   id: string;
   name: string;
-  status: "ok" | "down" | "unconfigured";
+  status: "ok" | "down" | "pending" | "unconfigured";
   detail: string;
 }
 
@@ -17,6 +17,7 @@ interface HealthData {
 const STATUS_META: Record<Service["status"], { dot: string; text: string; label: string }> = {
   ok: { dot: "bg-positive", text: "text-positive", label: "ok" },
   down: { dot: "bg-negative", text: "text-negative", label: "down" },
+  pending: { dot: "bg-uncertain animate-pulse", text: "text-uncertain", label: "pending" },
   unconfigured: { dot: "bg-zinc-300", text: "text-subtle", label: "unconfigured" },
 };
 

@@ -18,10 +18,10 @@ interface NewIssueResult {
 }
 
 interface PossibleDuplicate {
-  name: string;
-  sentiment: { positive: number; negative: number; uncertain: number };
-  postUrls: PostSource[];
-  duplicateOf: { id: string; name: string; reason: string };
+  newIssueName: string;
+  existingIssueId: string;
+  existingIssueName: string;
+  reason: string;
 }
 
 interface ScanRequest {
@@ -163,24 +163,28 @@ const TYPE_BIAS_TERMS: Record<string, TypeBias> = {
 function buildExpandedQuery(topic: string, type?: string, focus?: string): string {
   const parts: string[] = [topic.trim()];
   const normalizedType = type?.trim();
-  const focusLower = (focus ?? '').toLowerCase().trim();
+  // Focus may be a comma-separated list (e.g. "bugs, complaints") — each term
+  // contributes its own bias terms and is added to the query literally.
+  const focusTerms = (focus ?? '')
+    .split(',')
+    .map((t) => t.trim())
+    .filter(Boolean);
+  const focusLower = focusTerms.join(' ').toLowerCase();
 
   if (normalizedType && normalizedType !== 'Auto Detect') {
     const bias = TYPE_BIAS_TERMS[normalizedType];
     if (bias) {
-      const matchedKeys = Object.keys(bias.byFocus).filter(key =>
-        focusLower ? focusLower.includes(key) : false
-      );
+      const matchedKeys = focusLower
+        ? Object.keys(bias.byFocus).filter(key => focusLower.includes(key))
+        : [];
       const terms = matchedKeys.length > 0
-        ? matchedKeys.flatMap(key => bias.byFocus[key])
+        ? Array.from(new Set(matchedKeys.flatMap(key => bias.byFocus[key])))
         : bias.default;
       parts.push(...terms);
     }
   }
 
-  if (focus?.trim()) {
-    parts.push(focus.trim());
-  }
+  parts.push(...focusTerms);
 
   return parts.join(' ');
 }
@@ -286,20 +290,19 @@ export async function POST(request: NextRequest) {
 
     const searchResults = (await Promise.all(searchPromises)).flatMap(r => r.results);
 
-    // Record this scan (including per-platform skip reasons) before returning.
-    // A failure to record must never fail the scan itself.
-    try {
-      await sql`
-        INSERT INTO scans (session_id, topic, type, focus, platforms, available_platforms, skipped_platforms, result_count, new_issue_count)
-        VALUES (${sessionId}, ${topic}, ${type ?? null}, ${focus ?? null}, ${platforms}, ${availablePlatforms}, ${JSON.stringify(skippedPlatforms)}::jsonb, ${searchResults.length}, 0)
-      `;
-    } catch (err) {
-      console.error('Failed to record scan history:', err);
-    }
-
     // No results from any available platform (e.g. every selected platform was
     // skipped for missing keys): return cleanly instead of running AI on nothing.
+    // The scan is still recorded in history exactly once (a failure to record
+    // must never fail the scan itself).
     if (searchResults.length === 0) {
+      try {
+        await sql`
+          INSERT INTO scans (session_id, topic, type, focus, platforms, available_platforms, skipped_platforms, result_count, new_issue_count)
+          VALUES (${sessionId}, ${topic}, ${type ?? null}, ${focus ?? null}, ${platforms}, ${availablePlatforms}, ${JSON.stringify(skippedPlatforms)}::jsonb, 0, 0)
+        `;
+      } catch (err) {
+        console.error('Failed to record scan history:', err);
+      }
       return NextResponse.json({
         sessionId,
         newIssues: [],
@@ -367,14 +370,10 @@ export async function POST(request: NextRequest) {
 
       if (duplicateMatch) {
         possibleDuplicates.push({
-          name: issue.name,
-          sentiment: issue.sentiment,
-          postUrls: issue.postUrls,
-          duplicateOf: {
-            id: duplicateMatch.existingIssueId,
-            name: duplicateMatch.existingIssueName,
-            reason: duplicateMatch.reason,
-          },
+          newIssueName: issue.name,
+          existingIssueId: duplicateMatch.existingIssueId,
+          existingIssueName: duplicateMatch.existingIssueName,
+          reason: duplicateMatch.reason,
         });
       } else {
         // Insert new issue
