@@ -3,25 +3,176 @@
 @tailwind utilities;
 
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --background: #fafaf9;
+  --surface: #ffffff;
+  --muted: #71717a;
+  --subtle: #a1a1aa;
+  --foreground: #18181b;
+  --border: #e4e4e7;
+  --positive: #16a34a;
+  --negative: #dc2626;
+  --uncertain: #d97706;
+  --accent: #4f46e5;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
+/* Base body styles */
+body {
+  color: var(--foreground);
+  background-color: var(--background);
+  /* One extremely faint radial wash for depth — barely-there, not a glow. */
+  background-image: radial-gradient(1100px 480px at 50% -160px, rgba(79, 70, 229, 0.05), transparent 65%);
+  background-attachment: fixed;
+  font-feature-settings: "rlig" 1, "calt" 1, "cv11" 1;
+  min-height: 100vh;
+  overflow-x: clip;
+  text-rendering: optimizeLegibility;
+}
+
+/* ------------------------------------------------------------------ */
+/* Root-cause autofill fix, applied project-wide.
+   Chrome paints autofilled fields with its own light background via
+   :-webkit-autofill, ignoring class-based background-color — and the
+   first text input on a form is exactly what autofill targets. The
+   inset box-shadow paints ABOVE the autofill background, and the huge
+   transition delay kills the background "flash" on autofill.           */
+/* ------------------------------------------------------------------ */
+input:-webkit-autofill,
+input:-webkit-autofill:hover,
+input:-webkit-autofill:focus,
+textarea:-webkit-autofill,
+textarea:-webkit-autofill:hover,
+textarea:-webkit-autofill:focus,
+select:-webkit-autofill,
+select:-webkit-autofill:hover,
+select:-webkit-autofill:focus {
+  -webkit-box-shadow: 0 0 0 1000px #ffffff inset;
+  -webkit-text-fill-color: var(--foreground);
+  caret-color: var(--foreground);
+  transition: background-color 10000000s ease-in-out 0s;
+}
+
+/* Accessible focus rings */
+*:focus-visible {
+  outline: 2px solid rgba(79, 70, 229, 0.55);
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+
+::selection {
+  background: rgba(79, 70, 229, 0.14);
+  color: #18181b;
+}
+
+/* Subtle scrollbar */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(113, 113, 122, 0.28);
+  border-radius: 8px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(113, 113, 122, 0.45);
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+
+/* Page transitions — soft fade + rise on route change (respects reduced motion) */
+@keyframes pageIn {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+.page-enter {
+  animation: pageIn 0.45s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(16px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+.rise {
+  animation: rise 0.6s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .page-enter,
+  .rise {
+    animation: none !important;
   }
 }
 
-body {
-  color: var(--foreground);
-  background: var(--background);
-  font-family: Arial, Helvetica, sans-serif;
+/* Ripple loading animation */
+@keyframes ripple {
+  0% {
+    transform: scale(0);
+    opacity: 0.8;
+  }
+  70% {
+    transform: scale(4);
+    opacity: 0;
+  }
+  100% {
+    opacity: 0;
+  }
+}
+
+.ripple-loading {
+  position: relative;
+  overflow: hidden;
+}
+.ripple-loading::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  background: currentColor;
+  animation: ripple 1.2s infinite;
 }
 
 @layer utilities {
-  .text-balance {
-    text-wrap: balance;
+  .bg-grid-pattern {
+    background-image: linear-gradient(to right, rgba(24, 24, 27, 0.035) 1px, transparent 1px),
+      linear-gradient(to bottom, rgba(24, 24, 27, 0.035) 1px, transparent 1px);
+    background-size: 36px 36px;
+  }
+
+  .text-gradient {
+    background: linear-gradient(110deg, #4338ca 0%, #4f46e5 45%, #0284c7 100%);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+
+  /* Standard card: white, hairline border, whisper of shadow. */
+  .card {
+    background: #ffffff;
+    border: 1px solid rgba(24, 24, 27, 0.08);
+    box-shadow: 0 1px 2px 0 rgb(0 0 0 / 0.04), 0 1px 3px 0 rgb(0 0 0 / 0.03);
+  }
+
+  .card-hover {
+    transition: border-color 0.15s ease, box-shadow 0.15s ease, transform 0.15s ease;
+  }
+  .card-hover:hover {
+    border-color: rgba(24, 24, 27, 0.16);
+    box-shadow: 0 4px 12px -2px rgb(0 0 0 / 0.08), 0 2px 4px -2px rgb(0 0 0 / 0.04);
   }
 }

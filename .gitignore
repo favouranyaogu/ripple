@@ -31,6 +31,13 @@ yarn-error.log*
 # vercel
 .vercel
 
+# local tooling / agent scaffolding (never push these)
+.agents/
+.freebuff/
+.neon
+skills-lock.json
+request.json
+
 # typescript
 *.tsbuildinfo
 next-env.d.ts
