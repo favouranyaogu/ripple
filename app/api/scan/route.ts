@@ -286,7 +286,10 @@ export async function POST(request: NextRequest) {
     if (availablePlatforms.includes('web')) searchPromises.push(searchWeb(searchQuery));
     if (availablePlatforms.includes('reddit')) searchPromises.push(searchReddit(searchQuery));
     if (availablePlatforms.includes('twitter')) searchPromises.push(searchTwitter(searchQuery));
-    if (availablePlatforms.includes('bluesky')) searchPromises.push(searchBluesky(searchQuery));
+    // Bluesky's full-text search ANDs every term, so the long Tavily-style query
+    // (with "OR" modifiers, "forum", "reddit"...) returns zero posts. Give it
+    // just the topic — Gemini clusters/filters the results anyway.
+    if (availablePlatforms.includes('bluesky')) searchPromises.push(searchBluesky(topic.trim()));
 
     const searchResults = (await Promise.all(searchPromises)).flatMap(r => r.results);
 
@@ -319,6 +322,7 @@ export async function POST(request: NextRequest) {
       else if (url.includes('x.com') || url.includes('twitter.com')) platform = 'x';
       else if (url.includes('youtube.com')) platform = 'youtube';
       else if (url.includes('github.com')) platform = 'github';
+      else if (url.includes('bsky.app')) platform = 'bluesky';
 
       return {
         content: `${r.title}\n${r.content}`,
