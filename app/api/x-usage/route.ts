@@ -5,6 +5,9 @@ import { getXDailyBudget, setXDailyBudget } from '@/lib/budget';
 
 // Always read env vars / settings at request time instead of baking values in at build time.
 export const dynamic = 'force-dynamic';
+// Usage/budget must reflect the DB and env as they are now (in some Next
+// versions force-dynamic alone isn't enough).
+export const fetchCache = 'force-no-store';
 
 const MIN_BUDGET = 0.01;
 const MAX_BUDGET = 1000;
@@ -49,7 +52,9 @@ async function buildUsagePayload() {
  * and the last 7 days of usage history.
  */
 export async function GET() {
-  return NextResponse.json(await buildUsagePayload());
+  return NextResponse.json(await buildUsagePayload(), {
+    headers: { 'Cache-Control': 'no-store, no-cache, must-revalidate' },
+  });
 }
 
 /**

@@ -1,4 +1,5 @@
 import { sql } from '@/lib/db';
+import { daysAgoISO, type SearchWindow } from '@/lib/time';
 
 export interface PlatformSearchResult {
   title: string;
@@ -27,9 +28,12 @@ export function getXMaxResults(): number {
 /**
  * Searches Twitter/X via API v2 "recent search".
  * Requires a TWITTER_BEARER_TOKEN env var (app-only bearer token).
+ * `window` (optional) limits results via `start_time`/`end_time`. Recent search
+ * only indexes the last 7 days, so the start is clamped to at most 7 days back
+ * — a longer window simply returns what the API can see.
  * Returns the same shape as searchWeb: { results: [{ title, url, content }] }.
  */
-export async function searchTwitter(query: string): Promise<{ results: PlatformSearchResult[] }> {
+export async function searchTwitter(query: string, window?: SearchWindow): Promise<{ results: PlatformSearchResult[] }> {
   const bearerToken = process.env.TWITTER_BEARER_TOKEN;
   if (!bearerToken) {
     throw new Error('TWITTER_BEARER_TOKEN is not configured');
@@ -42,6 +46,19 @@ export async function searchTwitter(query: string): Promise<{ results: PlatformS
     'expansions': 'author_id',
     'user.fields': 'username',
   });
+  if (window) {
+    if (window.since) {
+      // X rejects start_time older than 7 days — clamp to what it can serve.
+      const sinceMs = Date.parse(window.since);
+      const sevenDaysAgo = Date.now() - 7 * 86_400_000;
+      params.set('start_time', Number.isFinite(sinceMs) && sinceMs < sevenDaysAgo
+        ? new Date(sevenDaysAgo).toISOString()
+        : window.since);
+    } else if (window.days && window.days > 0) {
+      params.set('start_time', daysAgoISO(Math.min(window.days, 7)));
+    }
+    if (window.until) params.set('end_time', window.until);
+  }
 
   const res = await fetch(`https://api.twitter.com/2/tweets/search/recent?${params.toString()}`, {
     headers: { Authorization: `Bearer ${bearerToken}` },

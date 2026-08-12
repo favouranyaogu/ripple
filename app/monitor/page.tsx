@@ -5,6 +5,7 @@ import Link from "next/link";
 import IssueCard from "@/components/monitor/IssueCard";
 import DuplicatesSection from "@/components/monitor/DuplicatesSection";
 import ServiceHealth from "@/components/ServiceHealth";
+import { TIME_RANGE_OPTIONS, parseTimeRange, todayDateStr, type TimeRangeId } from "@/lib/time";
 
 interface ScanResponse {
   sessionId?: string;
@@ -44,6 +45,7 @@ interface ScanHistory {
   focus: string | null;
   platforms: string[];
   skipped: (string | { platform: string; reason: string })[];
+  timeRange: string | null;
   resultCount: number;
   newIssueCount: number;
   createdAt: string;
@@ -115,6 +117,81 @@ const FOCUS_SUGGESTIONS = ["security", "bugs", "complaints", "pricing", "sentime
 
 const SUBTARGET_EXAMPLE = "Phantom Wallet, MetaMask, Trust Wallet";
 
+type SearchMode = "guided" | "free";
+
+const FREE_QUERY_EXAMPLES = [
+  "crypto wallet complaints",
+  "AI chatbot privacy concerns",
+  "electric vehicle charging problems",
+  "payment app outages",
+];
+
+// Short labels for the compact time-range control ("All / 24h / 7d / 30d / Custom").
+const TIME_RANGE_CHOICES = TIME_RANGE_OPTIONS.map((o) => ({ id: o.id, label: o.short }));
+
+/** YYYY-MM-DD `days` ago (local time) — used to default the custom range. */
+function dateStrDaysAgo(days: number): string {
+  const d = new Date(Date.now() - days * 86_400_000);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+/** Human label for a stored time_range (preset id or custom:start:end). */
+function timeRangeLabel(canonical: string | null): string | null {
+  if (!canonical) return null;
+  if (canonical.startsWith("custom:")) {
+    const [, start, end] = canonical.split(":");
+    if (!start) return "custom";
+    const fmt = (d: string) => {
+      const [, m, day] = d.split("-");
+      return `${m}/${day}`;
+    };
+    return `${fmt(start)} → ${end ? fmt(end) : "now"}`;
+  }
+  const opt = TIME_RANGE_OPTIONS.find((o) => o.id === canonical);
+  return opt ? (opt.short === "All" ? "all time" : opt.short) : null;
+}
+
+/**
+ * Small segmented pill control used for Search style, scan mode, and the
+ * time-range picker — same visual language as the app's other toggles.
+ */
+function Segmented<T extends string>({
+  value,
+  options,
+  onChange,
+  label,
+  disabled,
+}: {
+  value: T;
+  options: { id: T; label: string }[];
+  onChange: (id: T) => void;
+  label?: string;
+  disabled?: boolean;
+}) {
+  return (
+    <div
+      className="inline-flex rounded-lg border border-zinc-200 bg-zinc-50 p-0.5 gap-0.5"
+      role="group"
+      aria-label={label}
+    >
+      {options.map((o) => (
+        <button
+          key={o.id}
+          type="button"
+          disabled={disabled}
+          onClick={() => onChange(o.id)}
+          className={`px-3.5 py-1.5 rounded-md text-xs font-medium transition-all disabled:cursor-not-allowed ${
+            value === o.id ? "bg-white text-foreground shadow-sm" : "text-muted hover:text-foreground"
+          }`}
+        >
+          {o.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Field styling. The background is a SOLID color so the autofill override
 // below can match it exactly.
@@ -141,6 +218,8 @@ const inputClass =
   "w-full px-3.5 py-2.5 rounded-lg bg-white border border-zinc-300 text-foreground text-sm placeholder:text-subtle focus:outline-none focus:border-accent focus:ring-4 focus:ring-accent/10 transition-all disabled:opacity-60 disabled:cursor-not-allowed";
 const inputErrorClass =
   "w-full px-3.5 py-2.5 rounded-lg bg-white border border-red-300 text-foreground text-sm placeholder:text-subtle focus:outline-none focus:border-red-400 focus:ring-4 focus:ring-red-100 transition-all";
+const dateInputClass =
+  "px-3 py-2 rounded-lg bg-white border border-zinc-300 text-foreground text-sm focus:outline-none focus:border-accent focus:ring-4 focus:ring-accent/10 transition-all disabled:opacity-60 disabled:cursor-not-allowed";
 
 const cardClass = "card rounded-2xl";
 const labelClass = "block mb-1.5 text-[13px] font-medium text-foreground";
@@ -174,6 +253,15 @@ export default function MonitorPage() {
   const [focus, setFocus] = useState("");
   const [batchFocus, setBatchFocus] = useState("");
   const [batchMode, setBatchMode] = useState(false);
+  // "guided" = topic + type + focus expand the query with bias terms;
+  // "free" = the query goes to every platform verbatim and AI clusters freely.
+  const [searchMode, setSearchMode] = useState<SearchMode>("guided");
+  // Time window applied to every platform (defaults to last 7 days — the
+  // monitoring sweet spot; "All" restores the previous unbounded behavior).
+  const [timeRange, setTimeRange] = useState<TimeRangeId>("7d");
+  // Custom range (YYYY-MM-DD) when timeRange === "custom".
+  const [startDate, setStartDate] = useState("");
+  const [endDate, setEndDate] = useState("");
   const [subTargetsText, setSubTargetsText] = useState("");
   const [delaySeconds, setDelaySeconds] = useState("30");
   const [platforms, setPlatforms] = useState<string[]>(["web"]);
@@ -304,6 +392,23 @@ export default function MonitorPage() {
     setPlatforms((prev) => (prev.includes(platform) ? prev.filter((p) => p !== platform) : [...prev, platform]));
   };
 
+  // Free search only supports a single pass (batch needs the guided structure),
+  // so switching to it drops out of batch mode.
+  const changeSearchMode = (m: SearchMode) => {
+    setSearchMode(m);
+    if (m === "free") setBatchMode(false);
+  };
+
+  // Switching to a custom range pre-fills sensible defaults (last 7 days) the
+  // first time, so the two date inputs never sit empty.
+  const changeTimeRange = (id: TimeRangeId) => {
+    setTimeRange(id);
+    if (id === "custom") {
+      if (!startDate) setStartDate(dateStrDaysAgo(7));
+      if (!endDate) setEndDate(todayDateStr());
+    }
+  };
+
   const startBudgetEdit = () => {
     setBudgetDraft(String(xUsage?.budget ?? 3));
     setBudgetEditing(true);
@@ -346,6 +451,10 @@ export default function MonitorPage() {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (loading) return;
+    if (timeRange === "custom" && (!startDate || (endDate && endDate < startDate))) {
+      setError("Pick a valid custom range — the start date must be on or before the end date.");
+      return;
+    }
     setLoading(true);
     setHasScanned(true);
     setError(null);
@@ -366,6 +475,9 @@ export default function MonitorPage() {
           type,
           focus,
           platforms,
+          mode: searchMode,
+          timeRange,
+          ...(timeRange === "custom" ? { startDate, endDate } : {}),
           ...(sessionRef.current.id ? { sessionId: sessionRef.current.id } : {}),
         }),
       });
@@ -422,13 +534,21 @@ export default function MonitorPage() {
     setPastScanIssues([]);
   };
 
-  // Re-fills the form from a past scan (Recent scans timeline).
+  // Re-fills the form from a past scan (Recent scans timeline). A scan with no
+  // type and no focus was a free search, so re-run it in free mode; otherwise
+  // restore the guided form.
   const rerunScan = (s: ScanHistory) => {
     setBatchMode(false);
+    setSearchMode(!s.type && !s.focus ? "free" : "guided");
     setTopic(s.topic);
     setType(s.type || "Auto Detect");
     setFocus(s.focus || "");
     setPlatforms(s.platforms.length > 0 ? s.platforms : ["web"]);
+    // Restore the exact window the original scan ran with (preset or custom).
+    const { timeRange: tr, startDate: sd, endDate: ed } = parseTimeRange(s.timeRange ?? null);
+    setTimeRange(tr);
+    setStartDate(sd ?? "");
+    setEndDate(ed ?? "");
     setError(null);
     window.scrollTo({ top: 0, behavior: "smooth" });
   };
@@ -553,7 +673,16 @@ export default function MonitorPage() {
       const res = await fetch("/api/batch-scan", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ topic, type, focus: batchFocus, subTargets: parsedTargets, platforms, delaySeconds: delay }),
+        body: JSON.stringify({
+          topic,
+          type,
+          focus: batchFocus,
+          subTargets: parsedTargets,
+          platforms,
+          delaySeconds: delay,
+          timeRange,
+          ...(timeRange === "custom" ? { startDate, endDate } : {}),
+        }),
         signal: abort.signal,
       });
       if (!res.ok || !res.body) {
@@ -697,51 +826,61 @@ export default function MonitorPage() {
             <div className="flex items-center justify-between gap-4 flex-wrap">
               <div>
                 <h2 className="font-display text-2xl font-semibold text-foreground tracking-tight">
-                  {batchMode ? "Batch scan" : "Single scan"}
+                  {searchMode === "free"
+                    ? "Free search"
+                    : batchMode
+                    ? "Batch scan"
+                    : "Single scan"}
                 </h2>
                 <p className="text-xs text-muted mt-1">
-                  {batchMode
+                  {searchMode === "free"
+                    ? "One raw query across the selected platforms — no type or focus bias."
+                    : batchMode
                     ? "Run each sub-target as its own scan, sequentially."
                     : "One topic, one pass across the selected platforms."}
                 </p>
               </div>
-              <div
-                className="inline-flex rounded-lg border border-zinc-200 bg-zinc-50 p-0.5 gap-0.5"
-                role="group"
-                aria-label="Scan mode"
-              >
-                <button
-                  type="button"
-                  onClick={() => setBatchMode(false)}
+              {searchMode === "guided" && (
+                <Segmented
+                  value={batchMode ? "batch" : "single"}
+                  options={[
+                    { id: "single", label: "Single" },
+                    { id: "batch", label: "Batch" },
+                  ]}
+                  onChange={(id) => setBatchMode(id === "batch")}
+                  label="Scan mode"
                   disabled={batchRunning}
-                  className={`px-3.5 py-1.5 rounded-md text-xs font-medium transition-all disabled:cursor-not-allowed ${
-                    !batchMode
-                      ? "bg-white text-foreground shadow-sm"
-                      : "text-muted hover:text-foreground"
-                  }`}
-                >
-                  Single
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setBatchMode(true)}
-                  disabled={batchRunning}
-                  className={`px-3.5 py-1.5 rounded-md text-xs font-medium transition-all disabled:cursor-not-allowed ${
-                    batchMode
-                      ? "bg-white text-foreground shadow-sm"
-                      : "text-muted hover:text-foreground"
-                  }`}
-                >
-                  Batch
-                </button>
-              </div>
+                />
+              )}
             </div>
 
-            {/* Topic */}
+            {/* Search style: guided expansion vs free-form raw query */}
+            <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-zinc-200 bg-zinc-50/60 p-3.5">
+              <div className="min-w-0">
+                <p className="text-[13px] font-medium text-foreground">Search style</p>
+                <p className="text-[11px] text-subtle mt-0.5 leading-relaxed">
+                  {searchMode === "free"
+                    ? "Your query goes to every platform as-is — the AI clusters whatever themes emerge."
+                    : "Topic + type + focus expand the query with bias terms for sharper, on-target results."}
+                </p>
+              </div>
+              <Segmented
+                value={searchMode}
+                options={[
+                  { id: "guided", label: "Guided" },
+                  { id: "free", label: "Free search" },
+                ]}
+                onChange={changeSearchMode}
+                label="Search style"
+                disabled={loading || batchRunning}
+              />
+            </div>
+
+            {/* Topic (free search: the raw query) */}
             <div>
               <div className="flex items-center justify-between mb-1.5">
                 <label htmlFor="topic" className="text-[13px] font-medium text-foreground">
-                  Topic
+                  {searchMode === "free" ? "Query" : "Topic"}
                 </label>
                 <span className="font-mono text-[10px] text-subtle uppercase tracking-wider">
                   required
@@ -753,17 +892,21 @@ export default function MonitorPage() {
                 required
                 value={topic}
                 onChange={(e) => setTopic(e.target.value)}
-                placeholder="e.g. mobile banking apps, a product name, a brand…"
+                placeholder={
+                  searchMode === "free"
+                    ? "e.g. crypto wallet complaints, AI chatbot privacy concerns…"
+                    : "e.g. mobile banking apps, a product name, a brand…"
+                }
                 className={inputClass}
                 style={AUTOFILL_FIX}
                 disabled={batchRunning}
               />
-              {topic === "" && !batchRunning && pickChips.length > 0 && (
+              {topic === "" && !batchRunning && (searchMode === "free" ? FREE_QUERY_EXAMPLES : pickChips).length > 0 && (
                 <div className="mt-2.5 flex flex-wrap items-center gap-1.5">
                   <span className="font-mono text-[10px] uppercase tracking-wider text-subtle mr-0.5">
                     Try
                   </span>
-                  {pickChips.map((t) => (
+                  {(searchMode === "free" ? FREE_QUERY_EXAMPLES : pickChips).map((t) => (
                     <button
                       key={t}
                       type="button"
@@ -777,6 +920,9 @@ export default function MonitorPage() {
               )}
             </div>
 
+            {/* Guided mode only: type + focus / batch sub-targets. Free search has
+                no bias terms — the query itself is the entire search. */}
+            {searchMode !== "free" && (
             <div className="grid gap-5 sm:grid-cols-2">
               {/* Type */}
               <div>
@@ -923,6 +1069,7 @@ export default function MonitorPage() {
                 </div>
               )}
             </div>
+            )}
 
             {/* Batch pacing */}
             {batchMode && (
@@ -953,6 +1100,59 @@ export default function MonitorPage() {
                 </p>
               </div>
             )}
+
+            {/* Time range — same window applied to every platform */}
+            <div className="pt-1">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <p className="font-mono text-[11px] uppercase tracking-[0.2em] text-muted">
+                    Time range
+                  </p>
+                  <p className="text-[11px] text-subtle mt-0.5">
+                    Only posts from this window are searched, on every platform.
+                  </p>
+                </div>
+                <Segmented
+                  value={timeRange}
+                  options={TIME_RANGE_CHOICES}
+                  onChange={changeTimeRange}
+                  label="Time range"
+                  disabled={loading || batchRunning}
+                />
+              </div>
+              {timeRange === "custom" && (
+                <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-2">
+                  <label className="flex items-center gap-2 text-xs text-muted">
+                    From
+                    <input
+                      type="date"
+                      value={startDate}
+                      max={endDate || undefined}
+                      onChange={(e) => setStartDate(e.target.value)}
+                      className={dateInputClass}
+                      style={AUTOFILL_FIX}
+                      disabled={loading || batchRunning}
+                    />
+                  </label>
+                  <label className="flex items-center gap-2 text-xs text-muted">
+                    To
+                    <input
+                      type="date"
+                      value={endDate}
+                      min={startDate || undefined}
+                      onChange={(e) => setEndDate(e.target.value)}
+                      className={dateInputClass}
+                      style={AUTOFILL_FIX}
+                      disabled={loading || batchRunning}
+                    />
+                  </label>
+                  <span className="text-[11px] font-mono text-subtle">
+                    Note: X caps at 7 days and web search at 30 — wider custom ranges
+                    are clamped per platform.
+                  </span>
+                </div>
+              )}
+            </div>
 
             {/* Platforms */}
             <div className="pt-1">
@@ -1083,7 +1283,13 @@ export default function MonitorPage() {
                   disabled={loading || platforms.length === 0}
                   className={`${primaryBtn} w-full sm:w-auto ${loading ? "ripple-loading" : ""}`}
                 >
-                  {loading ? "Scanning…" : "Run Scan"}
+                  {loading
+                    ? searchMode === "free"
+                      ? "Searching…"
+                      : "Scanning…"
+                    : searchMode === "free"
+                    ? "Run Search"
+                    : "Run Scan"}
                 </button>
               )}
               <span className="font-mono text-[11px] text-subtle">
@@ -1277,7 +1483,11 @@ export default function MonitorPage() {
               </h2>
               <p className="text-sm text-muted max-w-md mx-auto leading-relaxed">
                 {hasScanned
-                  ? "This scan surfaced no emergent issues. Try a different topic, focus, or platform mix."
+                  ? searchMode === "free"
+                    ? "This search surfaced no emergent issues. Try a different query or platform mix."
+                    : "This scan surfaced no emergent issues. Try a different topic, focus, or platform mix."
+                  : searchMode === "free"
+                  ? "Type any query — like \"crypto wallet complaints\" — then pick platforms and run."
                   : "Pick a topic from the suggestions, or type your own — then choose platforms and run the scan."}
               </p>
             </div>
@@ -1529,11 +1739,21 @@ export default function MonitorPage() {
                       </button>
                     </div>
                     <div className="flex flex-wrap gap-1.5">
+                      {/* Free searches store no type/focus — tag them so they're
+                          recognizable in the timeline. */}
+                      {!s.type && !s.focus && (
+                        <span className="inline-flex items-center px-2 py-0.5 rounded-md bg-indigo-50 text-[10px] font-mono text-accent">
+                          free search
+                        </span>
+                      )}
                       {s.platforms.map((p) => (
                         <span key={p} className={chipClass}>
                           {p}
                         </span>
                       ))}
+                      {timeRangeLabel(s.timeRange) && (
+                        <span className={chipClass}>{timeRangeLabel(s.timeRange)}</span>
+                      )}
                       {s.skipped.map((sk, i) => (
                         <span
                           key={i}

@@ -5,6 +5,7 @@ import { searchReddit } from '@/lib/platforms/reddit';
 import { searchTwitter, X_COST_PER_READ, getXMaxResults } from '@/lib/platforms/twitter';
 import { searchBluesky } from '@/lib/platforms/bluesky';
 import { getXDailyBudget } from '@/lib/budget';
+import { timeRangeToWindow, canonicalTimeRange, type SearchWindow } from '@/lib/time';
 import { clusterPosts, flagDuplicateIssues, PostItem } from '@/lib/ai';
 
 const MAX_SUB_TARGETS = 25;
@@ -244,20 +245,22 @@ async function runSingleScan(opts: {
   platforms: string[];
   availablePlatforms: string[];
   baseSkipped: (string | { platform: string; reason: string })[];
+  window?: SearchWindow;
+  storedTimeRange: string | null;
 }): Promise<SingleScanResult> {
-  const { sessionId, topic, type, focus, platforms, availablePlatforms, baseSkipped } = opts;
+  const { sessionId, topic, type, focus, platforms, availablePlatforms, baseSkipped, window, storedTimeRange } = opts;
 
   const expandedQuery = buildExpandedQuery(topic, type, focus);
   const searchQuery = buildConsumerQuery(expandedQuery);
 
   const skippedPlatforms = [...baseSkipped];
-  const searchPromises: Promise<{ results: { title: string; url: string; content: string }[] }>[] = [];    if (availablePlatforms.includes('web')) searchPromises.push(searchWeb(searchQuery));
-    if (availablePlatforms.includes('reddit')) searchPromises.push(searchReddit(searchQuery));
-    if (availablePlatforms.includes('twitter')) searchPromises.push(searchTwitter(searchQuery));
+  const searchPromises: Promise<{ results: { title: string; url: string; content: string }[] }>[] = [];    if (availablePlatforms.includes('web')) searchPromises.push(searchWeb(searchQuery, window));
+    if (availablePlatforms.includes('reddit')) searchPromises.push(searchReddit(searchQuery, window));
+    if (availablePlatforms.includes('twitter')) searchPromises.push(searchTwitter(searchQuery, window));
     // Bluesky's full-text search ANDs every term, so the long Tavily-style query
     // (with "OR" modifiers, "forum", "reddit"...) returns zero posts. Give it
     // just the topic — Gemini clusters/filters the results anyway.
-    if (availablePlatforms.includes('bluesky')) searchPromises.push(searchBluesky(topic.trim()));
+    if (availablePlatforms.includes('bluesky')) searchPromises.push(searchBluesky(topic.trim(), window));
 
   const searchResults = (await Promise.all(searchPromises)).flatMap((r) => r.results);
 
@@ -348,8 +351,8 @@ async function runSingleScan(opts: {
   // show up in the Recent scans timeline. Failure to record must not fail.
   try {
     await sql`
-      INSERT INTO scans (session_id, topic, type, focus, platforms, available_platforms, skipped_platforms, result_count, new_issue_count)
-      VALUES (${sessionId}, ${topic}, ${type ?? null}, ${focus}, ${platforms}, ${availablePlatforms}, ${JSON.stringify(skippedPlatforms)}::jsonb, ${searchResults.length}, ${newIssues.length})
+      INSERT INTO scans (session_id, topic, type, focus, platforms, available_platforms, skipped_platforms, result_count, new_issue_count, time_range)
+      VALUES (${sessionId}, ${topic}, ${type ?? null}, ${focus}, ${platforms}, ${availablePlatforms}, ${JSON.stringify(skippedPlatforms)}::jsonb, ${searchResults.length}, ${newIssues.length}, ${storedTimeRange})
     `;
   } catch (err) {
     console.error('Failed to record batch scan history:', err);
@@ -368,11 +371,12 @@ const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve,
 
 /**
  * POST /api/batch-scan
- * Body: { topic, type?, focus?, subTargets: string[], platforms: string[], delaySeconds? }
+ * Body: { topic, type?, focus?, subTargets: string[], platforms: string[], delaySeconds?, timeRange?, startDate?, endDate? }
  *
  * `focus` (optional) is a comma-separated list of focus types (e.g.
  * "bugs, complaints") applied to every sub-target on top of the sub-target
- * itself.
+ * itself. `timeRange` (optional, e.g. "7d", or "custom" with startDate/
+ * endDate) limits every sub-target's search to the same window.
  *
  * Streams NDJSON events, one per line:
  *   {"type":"start", ...}
@@ -394,6 +398,9 @@ export async function POST(request: NextRequest) {
     subTargets?: unknown;
     platforms?: unknown;
     delaySeconds?: unknown;
+    timeRange?: unknown;
+    startDate?: unknown;
+    endDate?: unknown;
   };
   try {
     body = await request.json();
@@ -421,6 +428,11 @@ export async function POST(request: NextRequest) {
   const delay = Number.isFinite(delaySeconds) && delaySeconds >= 0
     ? Math.min(delaySeconds, MAX_DELAY_SECONDS)
     : DEFAULT_DELAY_SECONDS;
+  const rawTimeRange = typeof body.timeRange === 'string' ? body.timeRange : undefined;
+  const rawStartDate = typeof body.startDate === 'string' ? body.startDate : undefined;
+  const rawEndDate = typeof body.endDate === 'string' ? body.endDate : undefined;
+  const window = timeRangeToWindow(rawTimeRange, rawStartDate, rawEndDate);
+  const storedTimeRange = canonicalTimeRange(rawTimeRange, rawStartDate, rawEndDate);
 
   if (!topic || subTargets.length === 0 || platforms.length === 0) {
     return new Response(
@@ -450,7 +462,7 @@ export async function POST(request: NextRequest) {
         const total = subTargets.length;
         const { available, skipped: baseSkipped } = resolvePlatforms(platforms);
 
-        send({ type: 'start', total, topic, focus, subTargets, platforms, delaySeconds: delay });
+        send({ type: 'start', total, topic, focus, subTargets, platforms, delaySeconds: delay, timeRange: storedTimeRange ?? undefined });
 
         // One session for the whole batch so issues accumulate and dedupe.
         const sessionResult = await sql`
@@ -499,6 +511,8 @@ export async function POST(request: NextRequest) {
               platforms,
               availablePlatforms: available,
               baseSkipped,
+              window,
+              storedTimeRange,
             });
             completed++;
             send({

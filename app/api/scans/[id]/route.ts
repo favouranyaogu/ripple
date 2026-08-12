@@ -2,6 +2,9 @@ import { NextRequest, NextResponse } from 'next/server';
 import { sql } from '@/lib/db';
 
 export const dynamic = 'force-dynamic';
+// Per-scan results must reflect the DB as it is now (in some Next versions
+// force-dynamic alone isn't enough).
+export const fetchCache = 'force-no-store';
 
 /**
  * GET /api/scans/:id
@@ -62,19 +65,22 @@ export async function GET(
     }));
   })();
 
-  return NextResponse.json({
-    scan: {
-      id: String(r.id),
-      topic: r.topic,
-      type: r.type ?? null,
-      focus: r.focus ?? null,
-      platforms: r.platforms ?? [],
-      skipped: r.skipped_platforms ?? [],
-      resultCount: Number(r.result_count),
-      newIssueCount: Number(r.new_issue_count),
-      createdAt:
-        typeof r.created_at === 'string' ? r.created_at : new Date(r.created_at).toISOString(),
+  return NextResponse.json(
+    {
+      scan: {
+        id: String(r.id),
+        topic: r.topic,
+        type: r.type ?? null,
+        focus: r.focus ?? null,
+        platforms: r.platforms ?? [],
+        skipped: r.skipped_platforms ?? [],
+        resultCount: Number(r.result_count),
+        newIssueCount: Number(r.new_issue_count),
+        createdAt:
+          typeof r.created_at === 'string' ? r.created_at : new Date(r.created_at).toISOString(),
+      },
+      issues,
     },
-    issues,
-  });
+    { headers: { 'Cache-Control': 'no-store, no-cache, must-revalidate' } }
+  );
 }

@@ -1,3 +1,5 @@
+import { daysAgoISO, type SearchWindow } from '@/lib/time';
+
 export interface PlatformSearchResult {
   title: string;
   url: string;
@@ -7,9 +9,11 @@ export interface PlatformSearchResult {
 /**
  * Searches Bluesky via the AT Protocol (bsky.social).
  * Requires BLUESKY_HANDLE and BLUESKY_APP_PASSWORD env vars.
+ * `window` (optional) limits results via `since` (exact ISO start, or the last
+ * N days) and `until` (exact ISO end, for custom ranges).
  * Returns the same shape as searchWeb: { results: [{ title, url, content }] }.
  */
-export async function searchBluesky(query: string): Promise<{ results: PlatformSearchResult[] }> {
+export async function searchBluesky(query: string, window?: SearchWindow): Promise<{ results: PlatformSearchResult[] }> {
   const handle = process.env.BLUESKY_HANDLE;
   const appPassword = process.env.BLUESKY_APP_PASSWORD;
   if (!handle || !appPassword) {
@@ -32,8 +36,14 @@ export async function searchBluesky(query: string): Promise<{ results: PlatformS
   }
 
   // 2. Search posts with the session token
+  const searchParams = new URLSearchParams({ q: query, limit: '10' });
+  if (window) {
+    if (window.since) searchParams.set('since', window.since);
+    else if (window.days && window.days > 0) searchParams.set('since', daysAgoISO(window.days));
+    if (window.until) searchParams.set('until', window.until);
+  }
   const searchRes = await fetch(
-    `https://bsky.social/xrpc/app.bsky.feed.searchPosts?q=${encodeURIComponent(query)}&limit=10`,
+    `https://bsky.social/xrpc/app.bsky.feed.searchPosts?${searchParams.toString()}`,
     {
       headers: { Authorization: `Bearer ${accessJwt}` },
     }

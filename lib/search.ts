@@ -1,4 +1,5 @@
 import { tavily } from '@tavily/core';
+import type { SearchWindow } from '@/lib/time';
 
 const tvly = tavily({ apiKey: process.env.TAVILY_API_KEY || '' });
 
@@ -21,8 +22,16 @@ export function buildConsumerQuery(topic: string, community?: string, project?: 
   return baseQuery ? `${baseQuery} ${modifiers}` : modifiers;
 }
 
-export async function searchWeb(query: string): Promise<{ results: TavilyResult[] }> {
-  const response = await tvly.search(query);
+/**
+ * Searches the web via Tavily. `window` (optional) limits results to content
+ * published within the last N days (Tavily caps this at 30).
+ */
+export async function searchWeb(query: string, window?: SearchWindow): Promise<{ results: TavilyResult[] }> {
+  const days = window?.days;
+  const response = await tvly.search(
+    query,
+    days && days > 0 ? { days: Math.min(days, 30) } : undefined
+  );
   const results = ((response.results || []) as TavilyRawResult[]).map((r) => {
     const raw = r.content || '';
     const content = raw.length > 200 ? raw.slice(0, 200).trimEnd() + '…' : raw;

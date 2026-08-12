@@ -2,6 +2,9 @@ import { NextResponse } from "next/server";
 import https from "https";
 
 export const dynamic = "force-dynamic";
+// Health checks and env-driven status must never be cached (in some Next
+// versions force-dynamic alone isn't enough).
+export const fetchCache = "force-no-store";
 export const runtime = "nodejs";
 
 interface ProbeResult {
@@ -110,8 +113,11 @@ export async function GET() {
     })
   );
 
-  return NextResponse.json({
-    services,
-    checkedAt: new Date().toISOString(),
-  });
+  return NextResponse.json(
+    {
+      services,
+      checkedAt: new Date().toISOString(),
+    },
+    { headers: { 'Cache-Control': 'no-store, no-cache, must-revalidate' } }
+  );
 }

@@ -1,3 +1,5 @@
+import type { SearchWindow } from '@/lib/time';
+
 export interface PlatformSearchResult {
   title: string;
   url: string;
@@ -5,11 +7,23 @@ export interface PlatformSearchResult {
 }
 
 /**
+ * Maps a day count to Reddit's `t` (time filter) param.
+ */
+function redditTimeParam(days: number): string {
+  if (days <= 1) return 'day';
+  if (days <= 7) return 'week';
+  if (days <= 30) return 'month';
+  return 'all';
+}
+
+/**
  * Searches Reddit via the official API (OAuth2 client-credentials flow).
  * Requires REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET env vars.
+ * `window` (optional) limits results via `t` — Reddit only accepts preset
+ * windows, so custom ranges use the day count (rounded to the nearest preset).
  * Returns the same shape as searchWeb: { results: [{ title, url, content }] }.
  */
-export async function searchReddit(query: string): Promise<{ results: PlatformSearchResult[] }> {
+export async function searchReddit(query: string, window?: SearchWindow): Promise<{ results: PlatformSearchResult[] }> {
   const clientId = process.env.REDDIT_CLIENT_ID;
   const clientSecret = process.env.REDDIT_CLIENT_SECRET;
   if (!clientId || !clientSecret) {
@@ -36,8 +50,15 @@ export async function searchReddit(query: string): Promise<{ results: PlatformSe
   }
 
   // 2. Search submissions using the oauth.reddit.com endpoint
+  const searchParams = new URLSearchParams({
+    q: query,
+    limit: '10',
+    sort: 'relevance',
+    type: 'link',
+  });
+  if (window?.days && window.days > 0) searchParams.set('t', redditTimeParam(window.days));
   const searchRes = await fetch(
-    `https://oauth.reddit.com/search?q=${encodeURIComponent(query)}&limit=10&sort=relevance&type=link`,
+    `https://oauth.reddit.com/search?${searchParams.toString()}`,
     {
       headers: {
         Authorization: `Bearer ${accessToken}`,

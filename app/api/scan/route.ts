@@ -5,6 +5,7 @@ import { searchReddit } from '@/lib/platforms/reddit';
 import { searchTwitter, X_COST_PER_READ, getXMaxResults } from '@/lib/platforms/twitter';
 import { searchBluesky } from '@/lib/platforms/bluesky';
 import { getXDailyBudget } from '@/lib/budget';
+import { timeRangeToWindow, canonicalTimeRange } from '@/lib/time';
 import { clusterPosts, flagDuplicateIssues, PostSource } from '@/lib/ai';
 
 let lastScanTime = 0;
@@ -30,6 +31,13 @@ interface ScanRequest {
   type?: string;
   focus?: string;
   platforms: string[];
+  // "guided" (default) expands the query with type/focus bias terms;
+  // "free" sends the topic verbatim to every platform as a raw query.
+  mode?: string;
+  timeRange?: string;
+  // Custom date range (YYYY-MM-DD) when timeRange === "custom".
+  startDate?: string;
+  endDate?: string;
 }
 
 interface TypeBias {
@@ -206,7 +214,7 @@ export async function POST(request: NextRequest) {
     } catch {
       return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 });
     }
-    const { topic, type, focus, platforms } = body;
+    const { topic, type, focus, platforms, mode, timeRange, startDate, endDate } = body;
     let sessionId = body.sessionId;
 
     if (!topic || !Array.isArray(platforms) || platforms.length === 0) {
@@ -216,11 +224,23 @@ export async function POST(request: NextRequest) {
       );
     }
 
+    // Free search sends the topic verbatim to every platform — no type/focus
+    // bias terms, no "reviews OR complaints…" modifiers. Gemini still clusters
+    // whatever themes emerge. In this mode type/focus are ignored entirely.
+    const isFree = mode === 'free';
+    const effectiveType = isFree ? undefined : type;
+    const effectiveFocus = isFree ? undefined : focus;
+    // Time window (e.g. "7d" or a custom start/end) — resolved once and passed
+    // to each platform so every channel respects the same period. The canonical
+    // string is stored on the scan so it can be re-run with the exact window.
+    const window = timeRangeToWindow(timeRange, startDate, endDate);
+    const storedTimeRange = canonicalTimeRange(timeRange, startDate, endDate);
+
     // 1. Create or verify session
     if (!sessionId) {
       const sessionResult = await sql`
         INSERT INTO sessions (topic, community, project, type, focus, platforms)
-        VALUES (${topic}, '', '', ${type ?? null}, ${focus ?? null}, ${platforms})
+        VALUES (${topic}, '', '', ${effectiveType ?? null}, ${effectiveFocus ?? null}, ${platforms})
         RETURNING id
       `;
       sessionId = String(sessionResult[0].id);
@@ -229,8 +249,10 @@ export async function POST(request: NextRequest) {
     // 2. Search across selected platforms. A platform is skipped (and noted in
     //    the response) when its required env keys are missing, instead of
     //    failing the whole scan. Results from all available platforms are merged.
-    const expandedQuery = buildExpandedQuery(topic, type, focus);
-    const searchQuery = buildConsumerQuery(expandedQuery);
+    const expandedQuery = isFree
+      ? topic.trim()
+      : buildExpandedQuery(topic, effectiveType, effectiveFocus);
+    const searchQuery = isFree ? topic.trim() : buildConsumerQuery(expandedQuery);
 
     const skippedPlatforms: (string | { platform: string; reason: string })[] = [];
     const availablePlatforms: string[] = [];
@@ -283,13 +305,13 @@ export async function POST(request: NextRequest) {
     }
 
     const searchPromises: Promise<{ results: { title: string; url: string; content: string }[] }>[] = [];
-    if (availablePlatforms.includes('web')) searchPromises.push(searchWeb(searchQuery));
-    if (availablePlatforms.includes('reddit')) searchPromises.push(searchReddit(searchQuery));
-    if (availablePlatforms.includes('twitter')) searchPromises.push(searchTwitter(searchQuery));
+    if (availablePlatforms.includes('web')) searchPromises.push(searchWeb(searchQuery, window));
+    if (availablePlatforms.includes('reddit')) searchPromises.push(searchReddit(searchQuery, window));
+    if (availablePlatforms.includes('twitter')) searchPromises.push(searchTwitter(searchQuery, window));
     // Bluesky's full-text search ANDs every term, so the long Tavily-style query
     // (with "OR" modifiers, "forum", "reddit"...) returns zero posts. Give it
     // just the topic — Gemini clusters/filters the results anyway.
-    if (availablePlatforms.includes('bluesky')) searchPromises.push(searchBluesky(topic.trim()));
+    if (availablePlatforms.includes('bluesky')) searchPromises.push(searchBluesky(topic.trim(), window));
 
     const searchResults = (await Promise.all(searchPromises)).flatMap(r => r.results);
 
@@ -300,8 +322,8 @@ export async function POST(request: NextRequest) {
     if (searchResults.length === 0) {
       try {
         await sql`
-          INSERT INTO scans (session_id, topic, type, focus, platforms, available_platforms, skipped_platforms, result_count, new_issue_count)
-          VALUES (${sessionId}, ${topic}, ${type ?? null}, ${focus ?? null}, ${platforms}, ${availablePlatforms}, ${JSON.stringify(skippedPlatforms)}::jsonb, 0, 0)
+          INSERT INTO scans (session_id, topic, type, focus, platforms, available_platforms, skipped_platforms, result_count, new_issue_count, time_range)
+          VALUES (${sessionId}, ${topic}, ${effectiveType ?? null}, ${effectiveFocus ?? null}, ${platforms}, ${availablePlatforms}, ${JSON.stringify(skippedPlatforms)}::jsonb, 0, 0, ${storedTimeRange})
         `;
       } catch (err) {
         console.error('Failed to record scan history:', err);
@@ -410,8 +432,8 @@ export async function POST(request: NextRequest) {
 
     try {
       await sql`
-        INSERT INTO scans (session_id, topic, type, focus, platforms, available_platforms, skipped_platforms, result_count, new_issue_count)
-        VALUES (${sessionId}, ${topic}, ${type ?? null}, ${focus ?? null}, ${platforms}, ${availablePlatforms}, ${JSON.stringify(skippedPlatforms)}::jsonb, ${searchResults.length}, ${newIssues.length})
+        INSERT INTO scans (session_id, topic, type, focus, platforms, available_platforms, skipped_platforms, result_count, new_issue_count, time_range)
+        VALUES (${sessionId}, ${topic}, ${effectiveType ?? null}, ${effectiveFocus ?? null}, ${platforms}, ${availablePlatforms}, ${JSON.stringify(skippedPlatforms)}::jsonb, ${searchResults.length}, ${newIssues.length}, ${storedTimeRange})
       `;
     } catch (err) {
       console.error('Failed to record scan history:', err);
